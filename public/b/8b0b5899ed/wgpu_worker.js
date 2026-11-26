@@ -2643,23 +2643,56 @@ let shotEvery = isNode ? +(process.env.WGPU_SHOT_EVERY || 0) : 0;
 const shotPrefix = isNode ? (process.env.WGPU_SHOT_PREFIX || 'D:/wasm_tmp/shot_') : 'present';
 const shotAllRt = !isNode && new URLSearchParams(self.location.search).get('shotrt') === '1';		// the page's ?shotrt=1 (with ?shot=N): see present()
 let shotAllRtDone = false;
+let vrPort = null, vrStreamActive = false, vrCanvas = null, vrCtx = null, vrCtxW = 0, vrCtxH = 0, vrFrameBusy = false;
+function setupVrPort(port) {
+	vrPort = port;
+	vrPort.onmessage = (ev) => {
+		const d = ev.data;
+		if (!d) return;
+		if (d.vrActive !== undefined) vrStreamActive = !!d.vrActive;
+		if (d.ack) vrFrameBusy = false;
+	};
+}
 async function present(id) {
 	const t = objs.get(id);
-	if (t && canvasCtx) {
+	let vrShouldGrab = false;
+	if (t && (canvasCtx || (vrStreamActive && vrPort))) {
 		endPass();
-		// configure() reallocates the canvas's swap-chain textures: only on the first present and when the back buffer size changes (it ran every frame)
-		if (!canvasConfigured || canvas.width !== t.desc.size.width || canvas.height !== t.desc.size.height) {
-			canvas.width = t.desc.size.width; canvas.height = t.desc.size.height;
-			canvasCtx.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
-			canvasConfigured = true;
-		}
+		const tw = t.desc.size.width, th = t.desc.size.height;
 		if (!blit) makeBlit();
-		const pass2 = getEncoder().beginRenderPass({ colorAttachments: [{ view: canvasCtx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
-		pass2.setPipeline(blit);
 		if (!t.blitBG) t.blitBG = device.createBindGroup({ layout: blit.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.tex.createView({ dimension: '2d', baseMipLevel: 0, mipLevelCount: 1 }) }] });
-		pass2.setBindGroup(0, t.blitBG);
-		pass2.draw(3);
-		pass2.end();
+		if (canvasCtx) {
+			// configure() reallocates the canvas's swap-chain textures: only on the first present and when the back buffer size changes (it ran every frame)
+			if (!canvasConfigured || canvas.width !== tw || canvas.height !== th) {
+				canvas.width = tw; canvas.height = th;
+				canvasCtx.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+				canvasConfigured = true;
+			}
+			const pass2 = getEncoder().beginRenderPass({ colorAttachments: [{ view: canvasCtx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
+			pass2.setPipeline(blit);
+			pass2.setBindGroup(0, t.blitBG);
+			pass2.draw(3);
+			pass2.end();
+		}
+		if (vrStreamActive && vrPort && typeof OffscreenCanvas !== 'undefined') {
+			if (!vrCanvas) {
+				vrCanvas = new OffscreenCanvas(tw, th);
+				vrCtx = vrCanvas.getContext('webgpu');
+			}
+			if (vrCtx) {
+				if (vrCtxW !== tw || vrCtxH !== th) {
+					vrCanvas.width = tw; vrCanvas.height = th;
+					vrCtx.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+					vrCtxW = tw; vrCtxH = th;
+				}
+				const vrPass = getEncoder().beginRenderPass({ colorAttachments: [{ view: vrCtx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
+				vrPass.setPipeline(blit);
+				vrPass.setBindGroup(0, t.blitBG);
+				vrPass.draw(3);
+				vrPass.end();
+				vrShouldGrab = !vrFrameBusy;
+			}
+		}
 	}
 	// debugging aid: WGPU_SHOT_EVERY=<n> WGPU_SHOT_PREFIX=<path prefix> writes <prefix><presentNumber>.png every n-th present
 	presentCount++;
@@ -2761,6 +2794,13 @@ async function present(id) {
 		for (const tid of (isNode ? process.env.WGPU_SHOT_TEXS || '' : '').split(',').filter(Boolean)) await screenshot(+tid, shotPrefix + 'tex' + tid + '_' + String(presentCount).padStart(6, '0') + '.png');
 	}
 	flush('present');
+	if (vrShouldGrab && vrCanvas && vrPort) {
+		vrFrameBusy = true;
+		createImageBitmap(vrCanvas).then((bmp) => {
+			try { vrPort.postMessage({ bitmap: bmp, w: vrCtxW, h: vrCtxH }, [bmp]); }
+			catch { bmp.close(); vrFrameBusy = false; }
+		}, () => { vrFrameBusy = false; });
+	}
 	frameSlotDone[ubo.slot] = device.queue.onSubmittedWorkDone();
 	ubo.slot = (ubo.slot + 1) % FRAME_SLOTS; ubo.chunk = 0; ubo.off = 0; ubo.frame++;
 	const tw0 = performance.now();
@@ -2965,5 +3005,8 @@ if (!isNode) {
 	self.postMessage({ loaded: true });		// loader.js waits for this before it starts the engine (see there)
 }
 if (isNode && parentPort) parentPort.on('message', (m) => { start(m); });
-else if (!isNode) self.onmessage = (ev) => { start(ev.data); };
+else if (!isNode) self.onmessage = (ev) => {
+	if (ev.data && ev.data.vrPort) { setupVrPort(ev.data.vrPort); return; }
+	start(ev.data);
+};
 if (typeof module !== 'undefined') module.exports = { packUniforms, parseWgsl };

@@ -34,12 +34,13 @@
     addEventListener('keyup', e => { if (e.isTrusted) physical.delete(e.code); }, true);
     canvas.addEventListener('mousedown', e => { if (e.isTrusted) physicalMouse |= 1 << [0,2,1,3,4][e.button]; }, true);
     addEventListener('mouseup', e => { if (e.isTrusted) physicalMouse &= ~(1 << [0,2,1,3,4][e.button]); }, true);
-    const release = () => { physical.clear(); physicalMouse = 0; apply(empty()); remainderX = remainderY = 0; };
+    const release = () => { if (!active()) return; physical.clear(); physicalMouse = 0; apply(empty()); remainderX = remainderY = 0; };
     addEventListener('blur', release); document.addEventListener('visibilitychange', () => { if (document.hidden) release(); });
     function tick(now) {
       const dt = Math.min(.05, Math.max(0, (now - (last || now)) / 1000)); last = now;
+      if (!active()) { requestAnimationFrame(tick); return; }
       let pad; try { pad = [...getPads()].find(p => p?.connected && p.mapping === 'standard'); } catch {}
-      if (!pad || document.hidden || !document.hasFocus() || !active()) {
+      if (!pad || document.hidden || !document.hasFocus()) {
         apply(touchInput(empty())); toggleHeld = false; status(pad ? 'Controller paused · ' + (driving ? 'Driving' : 'On foot') : 'Press a controller button to connect');
       } else {
         const toggle = !!pad.buttons[8]?.pressed && !!pad.buttons[9]?.pressed;

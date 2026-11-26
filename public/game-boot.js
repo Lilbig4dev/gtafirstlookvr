@@ -214,7 +214,8 @@ const choose = (m) => {
 		if (startModeWord) Atomics.store(startModeWord, 0, m);
 		postLog('[page] start mode: ' + ({ 1: 'story', 2: 'sandbox', 3: 'sandbox on env_test' })[m]);
 	}
-	showModes();
+	window.__GTA5_ACT__ = act;
+showModes();
 };
 const act = (a) => {
 	if (startCommitted) return;
@@ -259,11 +260,11 @@ showModes();
 		}
 		if (m.gpuLost) { hud.textContent = 'The graphics device was lost (' + m.gpuLost + '): the screen will stay black. Reload the page.'; hud.style.color = '#f66'; return; }
 		if (m.error) { label.textContent = m.error; label.style.color = '#e66'; return; }
-		if (m.pct > target) { target = m.pct; if (m.label) { lastLabel = m.label; if (!waitingChoice) label.textContent = m.label; } if (m.pct >= 72 && worldBase < 0) worldBase = dataBytes; }
+		if (m.pct > target) { target = m.pct; window.__GTA5_LOAD_STATE__.pct = Math.max(window.__GTA5_LOAD_STATE__.pct, Math.round(m.pct)); if (m.label) window.__GTA5_LOAD_STATE__.label = m.label; if (m.label) { lastLabel = m.label; if (!waitingChoice) label.textContent = m.label; } if (m.pct >= 72 && worldBase < 0) worldBase = dataBytes; }
 		if (m.choice && !startMode) { waitingChoice = true; modesEl.classList.add('ask'); showModes(); }		// the engine waits for the choice: showModes asks for it in the label
 		if (m.commit) { startCommitted = true; pickingMap = false; if (m.mode) startMode = m.mode; showModes(); }		// the engine took the choice
 		if (m.compiling !== undefined && !waitingChoice) { label.textContent = lastLabel = 'Preparing shaders'; target = Math.max(target, 99); }		// the world is up; the GPU worker holds it until its pipelines are compiled
-		if (m.world) { ready = true; hud.textContent = 'click the game to capture the mouse (Esc releases it, Shift+P switches keyboard mode, = shows FPS)'; setTimeout(() => { hud.textContent = ''; }, 15000); }
+		if (m.world) { ready = true; window.__GTA5_LOAD_STATE__.ready = true; window.__GTA5_LOAD_STATE__.pct = 100; window.__GTA5_LOAD_STATE__.label = 'Ready'; window.__GTA5_LOAD_STATE__.act = act; window.dispatchEvent(new CustomEvent('gta5-world-ready')); hud.textContent = 'click the game to capture the mouse (Esc releases it, Shift+P switches keyboard mode, = shows FPS)'; setTimeout(() => { hud.textContent = ''; }, 15000); }
 	};
 	// Between reports the bar creeps forward (at most 6 points past the last report) so a long stage does not look frozen.
 	const dataEl = document.getElementById('data');
@@ -391,7 +392,10 @@ const ENGINE_ARGS = ['-fastscriptcore'];
 // this timer 2.1 ms, a 4 ms wait 5.0 ms). The game has no such timer, so every short sleep cost a whole tick: the limiter held a 60 fps cap to 37 fps and the visibility
 // wait added 15 ms to a frame. An empty callback; nothing else on this thread runs while the game plays.
 setInterval(() => {}, 1);
-const worker = new Worker(BASE + '/loader.js');
+const vrChannel = new MessageChannel();
+	window.__GTA5_VR_PORT__ = vrChannel.port1;
+	window.dispatchEvent(new CustomEvent('gta5-vr-port', { detail: vrChannel.port1 }));
+	const worker = new Worker(BASE + '/loader.js');
 	worker.onmessage = (ev) => {
 		if (ev.data.hud) hud.textContent = ev.data.hud;
 		if (ev.data.input) installInput(ev.data.input.memory, ev.data.input.block);
@@ -418,7 +422,8 @@ const worker = new Worker(BASE + '/loader.js');
 		syncPipelines: !!q.get('syncpipelines'),		// ?syncpipelines=1: the GPU worker compiles pipelines synchronously (no draws skipped while one compiles)
 		record: !!q.get('record'),		// ?record=1: log the boot read set (io_worker.js), for record_bootset.py
 		lowMemory,
-	}, [offscreen]);
+		vrPort: vrChannel.port2,
+	}, [offscreen, vrChannel.port2]);
 }
 
 // ?mem=1 (diagnostics, needs ?log=1): performance.measureUserAgentSpecificMemory() every 15 s (needs cross-origin isolation), posted to the dev server's log.
@@ -497,9 +502,28 @@ function installDebugPanel(memory, block) {
 }
 
 function installInput(memory, block) {
-	const _vrKeys = new Uint8Array(memory.buffer, block, 256);
-	const _vrW = new Int32Array(memory.buffer, block + 256, 10);
-	window.__GTA5_INPUT__ = { memory, block, keys: _vrKeys, w: _vrW, VK, canvas };
+	let _vrBuf = memory.buffer;
+	let _vrKeys = new Uint8Array(_vrBuf, block, 256);
+	let _vrW = new Int32Array(_vrBuf, block + 256, 10);
+	window.__GTA5_INPUT__ = {
+		memory,
+		block,
+		keys: _vrKeys,
+		w: _vrW,
+		VK,
+		canvas,
+		getSize: () => [W, H],
+		getViews: () => {
+			if (_vrBuf !== memory.buffer) {
+				_vrBuf = memory.buffer;
+				_vrKeys = new Uint8Array(_vrBuf, block, 256);
+				_vrW = new Int32Array(_vrBuf, block + 256, 10);
+				window.__GTA5_INPUT__.keys = _vrKeys;
+				window.__GTA5_INPUT__.w = _vrW;
+			}
+			return { keys: _vrKeys, w: _vrW };
+		}
+	};
 	window.dispatchEvent(new CustomEvent('gta5-input-ready', { detail: window.__GTA5_INPUT__ }));
 	if (q.get('dbg')) installDebugPanel(memory, block);
 	const keys = new Uint8Array(memory.buffer, block, 256);
@@ -575,7 +599,7 @@ if (!window.PlayGTA5Enhanced) {
 	});
 	const releaseAll = () => { held.clear(); for (let i = 0; i < 256; i++) Atomics.store(keys, i, 0); Atomics.store(w, BTN, 0); };
 	addEventListener('focus', () => { trace('window focus'); Atomics.store(w, FOCUS, 1); });
-	addEventListener('blur', () => { trace('window blur (all keys released)'); Atomics.store(w, FOCUS, 0); releaseAll(); });
+	addEventListener('blur', () => { if (window.__GTA5_VR_ACTIVE) return; trace('window blur (all keys released)'); Atomics.store(w, FOCUS, 0); releaseAll(); });
 
 	const locked = () => document.pointerLockElement === canvas;
 	canvas.addEventListener('mousedown', (e) => {
@@ -585,7 +609,7 @@ if (!window.PlayGTA5Enhanced) {
 	});
 	addEventListener('mouseup', (e) => { Atomics.and(w, BTN, ~(1 << [0, 2, 1, 3, 4][e.button])); });
 	addEventListener('contextmenu', (e) => e.preventDefault());
-	document.addEventListener('pointerlockchange', () => { trace('pointer lock ' + (locked() ? 'on' : 'off')); Atomics.store(w, LOCKED, locked() ? 1 : 0); });
+	document.addEventListener('pointerlockchange', () => { if (window.__GTA5_VR_ACTIVE) return; trace('pointer lock ' + (locked() ? 'on' : 'off')); Atomics.store(w, LOCKED, locked() ? 1 : 0); });
 	addEventListener('mousemove', (e) => {
 		const r = canvas.getBoundingClientRect();
 		if (locked()) {

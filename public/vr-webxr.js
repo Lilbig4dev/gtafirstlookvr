@@ -1,24 +1,41 @@
-/* Meta Quest 3 WebXR runtime & Touch Plus controller bridge for PlayGTA5 (WebGPU + WasmInputBlock). */
+/* Meta Quest 3 WebXR runtime, direct worker ImageBitmap stream, 3D laser pointer UI, and Touch Plus controller bridge for PlayGTA5. */
 (() => {
   'use strict';
 
-  const DEADZONE = 0.18;
+  const DEADZONE = 0.16;
   const LOOK_STICK_SPEED = 1150;
   const HEAD_LOOK_YAW_SENS = 920;
   const HEAD_LOOK_PITCH_SENS = 760;
+
+  const SCREEN_RADIUS = 2.6;
+  const SCREEN_HEIGHT = 1.72;
+  const SCREEN_ARC = (68 * Math.PI) / 180;
+
+  const BAR_RADIUS = 2.48;
+  const BAR_HEIGHT = 0.26;
+  const BAR_Y = -1.06;
+  const BAR_ARC = (56 * Math.PI) / 180;
 
   let xrSession = null;
   let xrRefSpace = null;
   let gl = null;
   let glProgram = null;
+  let rayProgram = null;
   let gameTex = null;
   let hudTex = null;
   let screenMesh = null;
   let hudMesh = null;
+  let rayVao = null;
+  let rayVbo = null;
+
+  // Direct frame stream from wgpu_worker.js (works even when 2D browser window is hidden/minimized)
+  let vrPort = null;
+  let latestBitmap = null;
+  let hasNewBitmap = false;
 
   let drivingMode = false;
   let headLookEnabled = true;
-  let followMode = false; // false = Theater Anchor (fixed in room, recenterable); true = Cockpit Follow
+  let followMode = false;
   let vrMenuCursorMode = false;
 
   let prevHeadYaw = null;
@@ -32,8 +49,24 @@
   let remLookX = 0;
   let remLookY = 0;
   let prevTime = 0;
+  let autoFirstPersonDone = false;
 
-  // Edge-triggered combo latches
+  // Queued key pulses so 30fps GTA V reliably sees discrete taps (120ms hold)
+  const activePulses = new Map(); // code -> expireMs
+  const scheduledPulses = [];     // { code, startMs, holdMs }
+
+  function schedulePulse(code, holdMs = 120, delayMs = 0) {
+    const now = performance.now();
+    scheduledPulses.push({ code, startMs: now + delayMs, holdMs });
+  }
+
+  function scheduleFirstPersonTriple() {
+    schedulePulse('KeyV', 120, 0);
+    schedulePulse('KeyV', 120, 260);
+    schedulePulse('KeyV', 120, 520);
+  }
+
+  // Edge-triggered combo/trigger latches
   let latchModeToggle = false;
   let latchPause = false;
   let latchHeadLook = false;
@@ -42,19 +75,24 @@
   let latchCursorMode = false;
   let latchStoryBtn = false;
   let latchSandboxBtn = false;
-  let latchMap5Btn = false;
-  let latchFpsView = false;
+  let latchMap6Btn = false;
+  let latchFpsClick = false;
+  let latchDriveCamClick = false;
+  const triggerLatches = { left: false, right: false };
 
-  // Fallback 2D canvas used to render loading screen / status while #loading is active
+  // Hover state for 3D laser pointers
+  let hoveredToolbarIdx = -1;
+  let hoveredLoadBtn = null;
+  let screenCursorUV = null;
+
   const mirrorCanvas = document.createElement('canvas');
   mirrorCanvas.width = 1280;
   mirrorCanvas.height = 720;
   const mirrorCtx = mirrorCanvas.getContext('2d');
 
-  // Floating HUD strip canvas rendered below the curved GTA V screen in VR
   const hudCanvas = document.createElement('canvas');
-  hudCanvas.width = 1024;
-  hudCanvas.height = 128;
+  hudCanvas.width = 1280;
+  hudCanvas.height = 176;
   const hudCtx = hudCanvas.getContext('2d');
   let lastHudSignature = '';
 
@@ -72,6 +110,34 @@
     showToast._t = setTimeout(() => { vrToast.hidden = true; }, ms);
   }
 
+  function attachVrPort(port) {
+    if (!port || vrPort === port) return;
+    vrPort = port;
+    vrPort.onmessage = (ev) => {
+      const d = ev.data;
+      if (!d || !d.bitmap) return;
+      if (latestBitmap) {
+        try { latestBitmap.close(); } catch {}
+      }
+      latestBitmap = d.bitmap;
+      hasNewBitmap = true;
+      if (!xrSession) {
+        try { vrPort.postMessage({ ack: true }); } catch {}
+      }
+    };
+    vrPort.postMessage({ vrActive: !!xrSession });
+  }
+
+  if (window.__GTA5_VR_PORT__) attachVrPort(window.__GTA5_VR_PORT__);
+  window.addEventListener('gta5-vr-port', (e) => attachVrPort(e.detail));
+
+  window.addEventListener('gta5-world-ready', () => {
+    if (xrSession && !autoFirstPersonDone) {
+      autoFirstPersonDone = true;
+      setTimeout(() => { if (xrSession) scheduleFirstPersonTriple(); }, 400);
+    }
+  });
+
   function applyDeadzone(v) {
     if (!Number.isFinite(v)) return 0;
     const clamped = Math.max(-1, Math.min(1, v));
@@ -80,31 +146,68 @@
     return Math.sign(clamped) * ((abs - DEADZONE) / (1 - DEADZONE));
   }
 
+  function isWorldReady() {
+    const st = window.__GTA5_LOAD_STATE__;
+    if (st && st.ready) return true;
+    const loadEl = document.getElementById('loading');
+    return !loadEl || loadEl.classList.contains('done');
+  }
+
   // ---- Shared-memory input writer (WasmInputBlock) ----
-  function releaseAllVRInputs() {
+  function getFreshViews() {
     const inp = window.__GTA5_INPUT__;
-    if (inp) {
+    if (!inp) return null;
+    if (typeof inp.getViews === 'function') return { ...inp.getViews(), VK: inp.VK, getSize: inp.getSize };
+    return { keys: inp.keys, w: inp.w, VK: inp.VK, getSize: inp.getSize };
+  }
+
+  function releaseAllVRInputs() {
+    const v = getFreshViews();
+    if (v) {
       for (const code of ownedKeys) {
-        const vk = inp.VK[code];
-        if (vk) Atomics.store(inp.keys, vk, 0);
+        const vk = v.VK[code];
+        if (vk) Atomics.store(v.keys, vk, 0);
       }
-      const curBtn = Atomics.load(inp.w, 5);
-      Atomics.store(inp.w, 5, curBtn & ~ownedMouse);
+      const curBtn = Atomics.load(v.w, 5);
+      Atomics.store(v.w, 5, curBtn & ~ownedMouse);
     }
     ownedKeys.clear();
     ownedMouse = 0;
     remLookX = 0;
     remLookY = 0;
+    activePulses.clear();
+    scheduledPulses.length = 0;
   }
 
-  function writeInputs(nextKeys, nextMouse, dx, dy, dz) {
-    const inp = window.__GTA5_INPUT__;
-    if (!inp) return;
-    const { keys, w, VK } = inp;
+  function writeInputs(nextKeys, nextMouse, dx, dy, dz, cursorUV) {
+    const v = getFreshViews();
+    if (!v) return;
+    const { keys, w, VK, getSize } = v;
 
-    // Keep engine focused & locked during VR gameplay unless menu cursor mode is toggled
-    Atomics.store(w, 6, 1); // FOCUS
+    // Apply any scheduled/active pulses (120ms holds so 30fps engine never misses taps)
+    const now = performance.now();
+    for (let i = scheduledPulses.length - 1; i >= 0; i--) {
+      if (now >= scheduledPulses[i].startMs) {
+        const p = scheduledPulses.splice(i, 1)[0];
+        activePulses.set(p.code, now + p.holdMs);
+      }
+    }
+    for (const [code, until] of activePulses) {
+      if (now < until) nextKeys.add(code);
+      else activePulses.delete(code);
+    }
+
+    // Keep engine focused and locked during gameplay unless cursor mode is active
+    Atomics.store(w, 6, 1); // FOCUS = 1
     Atomics.store(w, 7, vrMenuCursorMode ? 0 : 1); // LOCKED
+
+    if (vrMenuCursorMode && cursorUV && typeof getSize === 'function') {
+      const [W, H] = getSize();
+      const mx = Math.max(0, Math.min(W - 1, Math.round(cursorUV.u * W)));
+      const my = Math.max(0, Math.min(H - 1, Math.round(cursorUV.v * H)));
+      Atomics.store(w, 0, mx);
+      Atomics.store(w, 1, my);
+    }
 
     for (const code of new Set([...ownedKeys, ...nextKeys])) {
       const vk = VK[code];
@@ -121,11 +224,7 @@
     if (dz) Atomics.add(w, 4, dz);
   }
 
-  // ---- 4x4 Column-Major Matrix Helpers ----
-  function mat4Identity() {
-    return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
-  }
-
+  // ---- 4x4 Column-Major Matrix & Ray Helpers ----
   function mat4Multiply(a, b) {
     const out = new Float32Array(16);
     for (let c = 0; c < 4; c++) {
@@ -151,8 +250,63 @@
     ]);
   }
 
+  // Inverse of rigid translation+yaw matrix
+  function worldToLocalRay(origin, dir, ax, ay, az, yaw) {
+    const tx = origin.x - ax;
+    const ty = origin.y - ay;
+    const tz = origin.z - az;
+    const c = Math.cos(yaw);
+    const s = Math.sin(yaw);
+    return {
+      ox: c * tx - s * tz,
+      oy: ty,
+      oz: s * tx + c * tz,
+      dx: c * dir[0] - s * dir[2],
+      dy: dir[1],
+      dz: s * dir[0] + c * dir[2],
+    };
+  }
+
+  function transformRayDir(q) {
+    // Rotate local -Z (0, 0, -1) by quaternion q
+    const { x, y, z, w } = q;
+    const ix = -w * 0 + y * (-1) - z * 0;
+    const iy = -w * 0 + z * 0 - x * (-1);
+    const iz = w * (-1) + x * 0 - y * 0;
+    const iw = -x * 0 - y * 0 - z * (-1);
+    const rx = ix * w + iw * -x + iy * -z - iz * -y;
+    const ry = iy * w + iw * -y + iz * -x - ix * -z;
+    const rz = iz * w + iw * -z + ix * -y - iy * -x;
+    return [rx, ry, rz];
+  }
+
+  function intersectCurvedPanel(ray, radius, height, arcRad, yOffset) {
+    const a = ray.dx * ray.dx + ray.dz * ray.dz;
+    if (a < 1e-6) return null;
+    const b = 2 * (ray.ox * ray.dx + ray.oz * ray.dz);
+    const c = ray.ox * ray.ox + ray.oz * ray.oz - radius * radius;
+    const disc = b * b - 4 * a * c;
+    if (disc < 0) return null;
+    const sq = Math.sqrt(disc);
+    const candidates = [(-b + sq) / (2 * a), (-b - sq) / (2 * a)];
+    let best = null;
+    for (const t of candidates) {
+      if (t <= 0.1 || t > 12) continue;
+      const hx = ray.ox + t * ray.dx;
+      const hy = ray.oy + t * ray.dy;
+      const hz = ray.oz + t * ray.dz;
+      if (hz >= 0) continue; // front hemisphere only
+      const angle = Math.atan2(hx, -hz);
+      if (Math.abs(angle) > arcRad * 0.5) continue;
+      const v = (yOffset + height * 0.5 - hy) / height;
+      if (v < 0 || v > 1) continue;
+      const u = angle / arcRad + 0.5;
+      if (!best || t < best.t) best = { t, u, v };
+    }
+    return best;
+  }
+
   function quatToYawPitch(q) {
-    // q = {x, y, z, w}
     const { x, y, z, w } = q;
     const siny_cosp = 2 * (w * y - z * x);
     const cosy_cosp = 1 - 2 * (y * y + x * x);
@@ -168,7 +322,7 @@
     return d;
   }
 
-  // ---- WebGL2 Curved Screen & HUD Builder ----
+  // ---- WebGL2 Shaders & Meshes ----
   function createShader(type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
@@ -201,23 +355,49 @@
         fragColor = vec4(col.rgb, col.a * u_alpha);
       }
     `;
-    const vs = createShader(gl.VERTEX_SHADER, vsSrc);
-    const fs = createShader(gl.FRAGMENT_SHADER, fsSrc);
     glProgram = gl.createProgram();
-    gl.attachShader(glProgram, vs);
-    gl.attachShader(glProgram, fs);
+    gl.attachShader(glProgram, createShader(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(glProgram, createShader(gl.FRAGMENT_SHADER, fsSrc));
     gl.linkProgram(glProgram);
-    if (!gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
-      throw new Error('WebXR program link error: ' + gl.getProgramInfoLog(glProgram));
-    }
     glProgram.uMvp = gl.getUniformLocation(glProgram, 'u_mvp');
     glProgram.uTex = gl.getUniformLocation(glProgram, 'u_tex');
     glProgram.uAlpha = gl.getUniformLocation(glProgram, 'u_alpha');
 
-    // Curved 16:9 cinema arc: radius 2.6m, arc ~68 deg, height ~1.72m
-    screenMesh = buildCurvedQuad(2.6, 1.72, (68 * Math.PI) / 180, 0, 36);
-    // Floating HUD bar tucked just below the main screen
-    hudMesh = buildCurvedQuad(2.48, 0.24, (50 * Math.PI) / 180, -1.06, 20);
+    // Simple laser pointer line/dot shader
+    const rVs = `#version 300 es
+      layout(location = 0) in vec3 a_pos;
+      uniform mat4 u_vp;
+      void main() {
+        gl_Position = u_vp * vec4(a_pos, 1.0);
+        gl_PointSize = 10.0;
+      }
+    `;
+    const rFs = `#version 300 es
+      precision mediump float;
+      uniform vec4 u_color;
+      out vec4 fragColor;
+      void main() {
+        fragColor = u_color;
+      }
+    `;
+    rayProgram = gl.createProgram();
+    gl.attachShader(rayProgram, createShader(gl.VERTEX_SHADER, rVs));
+    gl.attachShader(rayProgram, createShader(gl.FRAGMENT_SHADER, rFs));
+    gl.linkProgram(rayProgram);
+    rayProgram.uVp = gl.getUniformLocation(rayProgram, 'u_vp');
+    rayProgram.uColor = gl.getUniformLocation(rayProgram, 'u_color');
+
+    screenMesh = buildCurvedQuad(SCREEN_RADIUS, SCREEN_HEIGHT, SCREEN_ARC, 0, 36);
+    hudMesh = buildCurvedQuad(BAR_RADIUS, BAR_HEIGHT, BAR_ARC, BAR_Y, 24);
+
+    rayVao = gl.createVertexArray();
+    gl.bindVertexArray(rayVao);
+    rayVbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, rayVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, 24, gl.DYNAMIC_DRAW); // 2 vertices * 3 floats
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 12, 0);
+    gl.bindVertexArray(null);
 
     gameTex = createDynamicTexture();
     hudTex = createDynamicTexture();
@@ -243,9 +423,7 @@
       const z = -Math.cos(angle) * radius;
       const yTop = yOffset + height * 0.5;
       const yBot = yOffset - height * 0.5;
-      // Top vertex (WebGL texImage2D on canvas: v=0 is top when UNPACK_FLIP_Y_WEBGL is false)
       verts.push(x, yTop, z, t, 0.0);
-      // Bottom vertex
       verts.push(x, yBot, z, t, 1.0);
       if (i < segs) {
         const b = i * 2;
@@ -268,90 +446,158 @@
     return { vao, count: indices.length };
   }
 
+  // ---- Interactive Loading Screen Canvas (with clickable laser buttons) ----
+  const LOAD_BUTTONS = [
+    { id: 'story', label: 'STORY MODE (A)', x: 140, y: 460, w: 300, h: 74 },
+    { id: 'map5',  label: 'SANDBOX · GTA V (X)', x: 490, y: 460, w: 300, h: 74 },
+    { id: 'map6',  label: 'SANDBOX · GTA VI (Y)', x: 840, y: 460, w: 300, h: 74 },
+  ];
+
   function updateLoadingMirrorTexture() {
-    const st = window.__GTA5_LOAD_STATE__ || { pct: 0, label: 'Starting...', dataMB: 0, waitingChoice: false, startMode: 0 };
+    const st = window.__GTA5_LOAD_STATE__ || { pct: 0, label: 'Starting...', dataMB: 0, startMode: 0 };
     const ctx = mirrorCtx;
     ctx.fillStyle = '#070a09';
     ctx.fillRect(0, 0, 1280, 720);
 
-    // Subtle Los Santos radial glow
-    const grad = ctx.createRadialGradient(640, 340, 40, 640, 340, 600);
-    grad.addColorStop(0, '#163528');
+    const grad = ctx.createRadialGradient(640, 320, 40, 640, 320, 620);
+    grad.addColorStop(0, '#163829');
     grad.addColorStop(1, '#070a09');
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, 1280, 720);
 
     ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 54px system-ui, sans-serif';
+    ctx.font = 'bold 52px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('GRAND THEFT AUTO V · QUEST 3 VR', 640, 210);
+    ctx.fillText('GRAND THEFT AUTO V · QUEST 3 VR', 640, 170);
 
     ctx.fillStyle = '#9fe2bf';
     ctx.font = '28px system-ui, sans-serif';
-    ctx.fillText(st.label + ' (' + st.pct + '%)', 640, 290);
+    ctx.fillText((st.label || 'Starting...') + ' (' + (st.pct || 0) + '%)', 640, 245);
 
     if (st.dataMB > 0) {
       ctx.fillStyle = '#7ea89a';
-      ctx.font = '22px monospace';
-      ctx.fillText('Game data streamed: ' + st.dataMB + ' MB', 640, 335);
+      ctx.font = '21px monospace';
+      ctx.fillText('Game data streamed: ' + st.dataMB + ' MB', 640, 290);
     }
 
-    // Progress bar
     ctx.fillStyle = 'rgba(255,255,255,0.14)';
-    ctx.fillRect(290, 375, 700, 14);
+    ctx.fillRect(290, 330, 700, 16);
     ctx.fillStyle = '#7cc576';
-    ctx.fillRect(290, 375, 7 * Math.max(0, Math.min(100, st.pct)), 14);
+    ctx.fillRect(290, 330, 7 * Math.max(0, Math.min(100, st.pct || 0)), 16);
 
-    // Mode selection instructions inside VR
-    ctx.fillStyle = '#e8f5ee';
-    ctx.font = 'bold 24px system-ui, sans-serif';
-    const modeName = st.startMode === 1 ? 'Story Mode' : st.startMode === 2 ? 'Sandbox (GTA V Map)' : st.startMode === 3 ? 'Sandbox (GTA VI Map)' : 'Waiting for choice';
-    ctx.fillText('Mode: ' + modeName, 640, 460);
+    const modeMap = { story: 1, map5: 2, map6: 3 };
+    for (const b of LOAD_BUTTONS) {
+      const selected = st.startMode === modeMap[b.id];
+      const hovered = hoveredLoadBtn === b.id;
+      ctx.fillStyle = selected ? '#2e6f4f' : hovered ? '#24523d' : '#13241d';
+      ctx.beginPath();
+      ctx.roundRect(b.x, b.y, b.w, b.h, 14);
+      ctx.fill();
+      ctx.strokeStyle = selected || hovered ? '#7cc576' : '#4a6b5b';
+      ctx.lineWidth = hovered ? 4 : 2;
+      ctx.stroke();
 
-    ctx.fillStyle = '#c4d8ce';
-    ctx.font = '21px system-ui, sans-serif';
-    ctx.fillText('Press [A] Story Mode   ·   Press [X] Sandbox (GTA V Map)   ·   Press [Y] Sandbox (GTA VI Map)', 640, 520);
-    ctx.fillText('Left Grip + Right Grip: Switch On-Foot / Driving   ·   Hold X + Y: Recenter VR Screen', 640, 565);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 21px system-ui, sans-serif';
+      ctx.fillText(b.label, b.x + b.w / 2, b.y + 44);
+    }
+
+    ctx.fillStyle = '#b4cbc0';
+    ctx.font = '19px system-ui, sans-serif';
+    ctx.fillText('Point controller laser + pull Trigger to click · Sandbox drops straight into Los Santos with weapons', 640, 610);
 
     gl.bindTexture(gl.TEXTURE_2D, gameTex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, mirrorCanvas);
   }
 
+  // ---- Interactive 7-Button VR Toolbar ----
+  const TOOLBAR_BUTTONS = [
+    { id: 'firstperson', label: () => '1ST PERSON (V)' },
+    { id: 'mode',        label: () => drivingMode ? 'MODE: DRIVING' : 'MODE: ON FOOT' },
+    { id: 'headlook',    label: () => 'HEAD-LOOK: ' + (headLookEnabled ? 'ON' : 'OFF') },
+    { id: 'screen',      label: () => 'SCREEN: ' + (followMode ? 'FOLLOW' : 'THEATER') },
+    { id: 'cursor',      label: () => 'CURSOR: ' + (vrMenuCursorMode ? 'ON' : 'OFF') },
+    { id: 'pause',       label: () => 'PAUSE / MAP' },
+    { id: 'recenter',    label: () => 'RECENTER' },
+    { id: 'exit',        label: () => 'EXIT VR' },
+  ];
+
+  function activateToolbarButton(id) {
+    if (id === 'firstperson') {
+      scheduleFirstPersonTriple();
+    } else if (id === 'mode') {
+      drivingMode = !drivingMode;
+    } else if (id === 'headlook') {
+      headLookEnabled = !headLookEnabled;
+      prevHeadYaw = null;
+      prevHeadPitch = null;
+    } else if (id === 'screen') {
+      followMode = !followMode;
+      needsRecenter = true;
+    } else if (id === 'cursor') {
+      vrMenuCursorMode = !vrMenuCursorMode;
+    } else if (id === 'pause') {
+      schedulePulse('Escape', 130, 0);
+      vrMenuCursorMode = !vrMenuCursorMode;
+    } else if (id === 'recenter') {
+      needsRecenter = true;
+    } else if (id === 'exit') {
+      if (xrSession) xrSession.end();
+    }
+  }
+
   function updateHudTexture() {
-    const sig = `${drivingMode}|${headLookEnabled}|${followMode}|${vrMenuCursorMode}`;
+    const sig = `${drivingMode}|${headLookEnabled}|${followMode}|${vrMenuCursorMode}|${hoveredToolbarIdx}`;
     if (sig === lastHudSignature) return;
     lastHudSignature = sig;
 
     const c = hudCtx;
-    c.clearRect(0, 0, 1024, 128);
-    c.fillStyle = 'rgba(10, 18, 15, 0.86)';
+    c.clearRect(0, 0, 1280, 176);
+    c.fillStyle = 'rgba(10, 18, 15, 0.9)';
     c.beginPath();
-    c.roundRect(12, 12, 1000, 104, 18);
+    c.roundRect(8, 8, 1264, 160, 18);
     c.fill();
     c.strokeStyle = 'rgba(124, 197, 118, 0.55)';
     c.lineWidth = 2;
     c.stroke();
 
-    c.textAlign = 'left';
-    c.font = 'bold 24px system-ui, sans-serif';
-    c.fillStyle = drivingMode ? '#ffd166' : '#7cc576';
-    c.fillText(drivingMode ? 'MODE: DRIVING (L+R Grip)' : 'MODE: ON FOOT (L+R Grip)', 40, 52);
+    const padX = 20;
+    const gap = 8;
+    const btnW = (1280 - padX * 2 - gap * (TOOLBAR_BUTTONS.length - 1)) / TOOLBAR_BUTTONS.length;
 
-    c.fillStyle = headLookEnabled ? '#7cc576' : '#94a3b8';
-    c.fillText('HEAD-LOOK: ' + (headLookEnabled ? 'ON' : 'OFF') + ' (L-Grip+X)', 400, 52);
+    for (let i = 0; i < TOOLBAR_BUTTONS.length; i++) {
+      const b = TOOLBAR_BUTTONS[i];
+      const bx = padX + i * (btnW + gap);
+      const hovered = hoveredToolbarIdx === i;
+      const activeAccent =
+        (b.id === 'mode' && drivingMode) ||
+        (b.id === 'headlook' && headLookEnabled) ||
+        (b.id === 'cursor' && vrMenuCursorMode);
 
-    c.fillStyle = '#d1fae5';
-    c.fillText('SCREEN: ' + (followMode ? 'FOLLOW' : 'THEATER') + ' (L-Grip+Y)', 700, 52);
+      c.fillStyle = hovered ? '#2d6b4d' : activeAccent ? '#1a4230' : '#12211b';
+      c.beginPath();
+      c.roundRect(bx, 22, btnW, 66, 10);
+      c.fill();
+      c.strokeStyle = hovered ? '#a7f3d0' : activeAccent ? '#7cc576' : '#415e51';
+      c.lineWidth = hovered ? 3 : 1.5;
+      c.stroke();
 
-    c.font = '20px system-ui, sans-serif';
+      c.fillStyle = b.id === 'exit' ? '#fca5a5' : '#ffffff';
+      c.font = 'bold 14px system-ui, sans-serif';
+      c.textAlign = 'center';
+      c.fillText(b.label(), bx + btnW / 2, 60);
+    }
+
+    c.textAlign = 'center';
+    c.font = '18px system-ui, sans-serif';
     c.fillStyle = '#cbd5e1';
     c.fillText(
       drivingMode
-        ? 'RT: Gas  |  LT: Brake  |  L-Stick: Steer  |  R-Grip/A: Handbrake  |  B: Camera (1st Person VR)  |  Y: Exit Car  |  X+Y: Recenter'
-        : 'L-Stick: Move  |  R-Stick/Head: Aim  |  RT: Fire  |  R-Grip: Aim  |  A: Jump  |  B: Sprint  |  Y: Enter Car  |  X+Y: Recenter',
-      40,
-      92
+        ? 'DRIVING: RT Gas | LT Brake | L-Stick Steer | A/R-Grip Handbrake | B Camera | Y Exit Car | L+R Grip: On-Foot'
+        : 'ON-FOOT: L-Stick Move | R-Stick & Head Aim | RT Fire | R-Grip Aim | A Jump | B Sprint | X Reload | Y Car | L+R Grip: Driving',
+      640,
+      134
     );
 
     gl.bindTexture(gl.TEXTURE_2D, hudTex);
@@ -359,27 +605,104 @@
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, hudCanvas);
   }
 
-  // ---- Quest 3 Input Processing ----
-  function processQuestInputs(session, pose, dt) {
+  // ---- Quest 3 Input & Raycast Processing ----
+  function processQuestInputs(session, frame, pose, dt) {
     const nextKeys = new Set();
     let nextMouse = 0;
     let dz = 0;
     let leftPad = null;
     let rightPad = null;
+    const raysToDraw = [];
+
+    hoveredToolbarIdx = -1;
+    hoveredLoadBtn = null;
+    screenCursorUV = null;
+
+    const ready = isWorldReady();
+    if (ready && !autoFirstPersonDone && window.__GTA5_INPUT__) {
+      autoFirstPersonDone = true;
+      setTimeout(() => { if (xrSession) scheduleFirstPersonTriple(); }, 350);
+    }
 
     for (const src of session.inputSources) {
-      if (!src.gamepad) continue;
-      if (src.handedness === 'left') leftPad = src.gamepad;
-      else if (src.handedness === 'right') rightPad = src.gamepad;
+      if (src.gamepad) {
+        if (src.handedness === 'left') leftPad = src.gamepad;
+        else if (src.handedness === 'right') rightPad = src.gamepad;
+      }
+
+      if (src.targetRaySpace) {
+        const rayPose = frame.getPose(src.targetRaySpace, xrRefSpace);
+        if (rayPose) {
+          const origin = rayPose.transform.position;
+          const dir = transformRayDir(rayPose.transform.orientation);
+          const localRay = worldToLocalRay(origin, dir, anchorPos[0], anchorPos[1], anchorPos[2], anchorYaw);
+          const barHit = intersectCurvedPanel(localRay, BAR_RADIUS, BAR_HEIGHT, BAR_ARC, BAR_Y);
+          const scrHit = intersectCurvedPanel(localRay, SCREEN_RADIUS, SCREEN_HEIGHT, SCREEN_ARC, 0);
+
+          const hand = src.handedness === 'left' ? 'left' : 'right';
+          const trigVal = src.gamepad && src.gamepad.buttons[0] ? src.gamepad.buttons[0].value : 0;
+          const trigDown = trigVal > 0.55;
+          const trigJustClicked = trigDown && !triggerLatches[hand];
+          triggerLatches[hand] = trigDown;
+
+          let hitDist = 3.2;
+          let hitColor = [0.49, 0.77, 0.46, 0.65];
+
+          if (barHit) {
+            hitDist = barHit.t;
+            hitColor = [0.65, 0.95, 0.82, 0.95];
+            const idx = Math.max(0, Math.min(TOOLBAR_BUTTONS.length - 1, Math.floor(barHit.u * TOOLBAR_BUTTONS.length)));
+            hoveredToolbarIdx = idx;
+            if (trigJustClicked) {
+              activateToolbarButton(TOOLBAR_BUTTONS[idx].id);
+            }
+          } else if (scrHit) {
+            hitDist = scrHit.t;
+            if (!ready) {
+              const px = scrHit.u * 1280;
+              const py = scrHit.v * 720;
+              for (const b of LOAD_BUTTONS) {
+                if (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) {
+                  hoveredLoadBtn = b.id;
+                  hitColor = [0.65, 0.95, 0.82, 0.95];
+                  if (trigJustClicked) {
+                    const actFn = window.__GTA5_ACT__ || (window.__GTA5_LOAD_STATE__ && window.__GTA5_LOAD_STATE__.act);
+                    if (typeof actFn === 'function') actFn(b.id);
+                  }
+                }
+              }
+            } else if (vrMenuCursorMode) {
+              hitColor = [1.0, 0.85, 0.4, 0.95];
+              if (src.handedness === 'right' || !screenCursorUV) {
+                screenCursorUV = { u: scrHit.u, v: scrHit.v };
+              }
+            }
+          }
+
+          if (!ready || vrMenuCursorMode || barHit) {
+            raysToDraw.push({
+              x0: origin.x, y0: origin.y, z0: origin.z,
+              x1: origin.x + dir[0] * hitDist,
+              y1: origin.y + dir[1] * hitDist,
+              z1: origin.z + dir[2] * hitDist,
+              color: hitColor,
+            });
+          }
+        }
+      }
     }
 
     const btn = (pad, idx) => !!(pad && pad.buttons[idx] && (pad.buttons[idx].pressed || pad.buttons[idx].value > 0.5));
     const trig = (pad, idx) => (pad && pad.buttons[idx] ? pad.buttons[idx].value : 0);
     const stick = (pad) => {
       if (!pad || !pad.axes) return [0, 0];
-      const ax = pad.axes.length >= 4 ? pad.axes[2] : pad.axes[0];
-      const ay = pad.axes.length >= 4 ? pad.axes[3] : pad.axes[1];
-      return [applyDeadzone(ax), applyDeadzone(ay)];
+      if (pad.axes.length >= 4 && (Math.abs(pad.axes[2]) > 0.02 || Math.abs(pad.axes[3]) > 0.02)) {
+        return [applyDeadzone(pad.axes[2]), applyDeadzone(pad.axes[3])];
+      }
+      if (pad.axes.length >= 4) {
+        return [applyDeadzone(pad.axes[2]), applyDeadzone(pad.axes[3])];
+      }
+      return [applyDeadzone(pad.axes[0]), applyDeadzone(pad.axes[1])];
     };
 
     const lGrip = btn(leftPad, 1);
@@ -391,76 +714,59 @@
     const btnA = btn(rightPad, 4);
     const btnB = btn(rightPad, 5);
 
-    // Loading screen mode selection via Quest buttons
-    const loadEl = document.getElementById('loading');
-    const st = window.__GTA5_LOAD_STATE__;
-    if (loadEl && st && typeof st.act === 'function') {
-      if (btnA && !latchStoryBtn) { st.act('story'); latchStoryBtn = true; }
-      else if (!btnA) latchStoryBtn = false;
+    // Loading screen controller shortcuts
+    if (!ready) {
+      const actFn = window.__GTA5_ACT__ || (window.__GTA5_LOAD_STATE__ && window.__GTA5_LOAD_STATE__.act);
+      if (typeof actFn === 'function') {
+        if (btnA && !latchStoryBtn) { actFn('story'); latchStoryBtn = true; }
+        else if (!btnA) latchStoryBtn = false;
 
-      if (btnX && !latchSandboxBtn) { st.act('map5'); latchSandboxBtn = true; }
-      else if (!btnX) latchSandboxBtn = false;
+        if (btnX && !latchSandboxBtn) { actFn('map5'); latchSandboxBtn = true; }
+        else if (!btnX) latchSandboxBtn = false;
 
-      if (btnY && !latchMap5Btn) { st.act('map6'); latchMap5Btn = true; }
-      else if (!btnY) latchMap5Btn = false;
+        if (btnY && !latchMap6Btn) { actFn('map6'); latchMap6Btn = true; }
+        else if (!btnY) latchMap6Btn = false;
+      }
     }
 
-    // Combo 1: Left Grip + Right Grip -> Toggle On-Foot / Driving
+    // System Combos
     const comboMode = lGrip && rGrip;
-    if (comboMode && !latchModeToggle) {
-      drivingMode = !drivingMode;
-      latchModeToggle = true;
-    } else if (!comboMode) {
-      latchModeToggle = false;
-    }
+    if (comboMode && !latchModeToggle) { drivingMode = !drivingMode; latchModeToggle = true; }
+    else if (!comboMode) latchModeToggle = false;
 
-    // Combo 2: Left Stick Click + Right Stick Click -> Pause Menu (Escape)
     const comboPause = lStickClick && rStickClick;
     if (comboPause && !latchPause) {
-      nextKeys.add('Escape');
+      schedulePulse('Escape', 130, 0);
+      vrMenuCursorMode = !vrMenuCursorMode;
       latchPause = true;
-    } else if (!comboPause) {
-      latchPause = false;
-    }
+    } else if (!comboPause) latchPause = false;
 
-    // Combo 3: Left Grip + X -> Toggle Head-Look
     const comboHead = lGrip && btnX;
     if (comboHead && !latchHeadLook) {
       headLookEnabled = !headLookEnabled;
       prevHeadYaw = null;
       prevHeadPitch = null;
       latchHeadLook = true;
-    } else if (!comboHead) {
-      latchHeadLook = false;
-    }
+    } else if (!comboHead) latchHeadLook = false;
 
-    // Combo 4: Left Grip + Y -> Toggle Theater vs Follow Screen
     const comboScreen = lGrip && btnY;
     if (comboScreen && !latchScreenMode) {
       followMode = !followMode;
       needsRecenter = true;
       latchScreenMode = true;
-    } else if (!comboScreen) {
-      latchScreenMode = false;
-    }
+    } else if (!comboScreen) latchScreenMode = false;
 
-    // Combo 5: X + Y -> Recenter VR Screen in front of Quest headset
     const comboRecenter = btnX && btnY;
     if (comboRecenter && !latchRecenter) {
       needsRecenter = true;
       latchRecenter = true;
-    } else if (!comboRecenter) {
-      latchRecenter = false;
-    }
+    } else if (!comboRecenter) latchRecenter = false;
 
-    // Combo 6: Left Grip + B -> Toggle Menu Cursor Mode (unlocks pointer for pause map clicks)
     const comboCursor = lGrip && btnB;
     if (comboCursor && !latchCursorMode) {
       vrMenuCursorMode = !vrMenuCursorMode;
       latchCursorMode = true;
-    } else if (!comboCursor) {
-      latchCursorMode = false;
-    }
+    } else if (!comboCursor) latchCursorMode = false;
 
     const [lx, ly] = stick(leftPad);
     const [rx, ry] = stick(rightPad);
@@ -468,62 +774,78 @@
     if (lx < -0.15) nextKeys.add('KeyA');
     if (lx > 0.15) nextKeys.add('KeyD');
 
+    const hoveringUI = hoveredToolbarIdx >= 0 || hoveredLoadBtn !== null;
+
     if (!comboMode && !comboHead && !comboScreen && !comboRecenter && !comboCursor && !comboPause) {
-      if (drivingMode) {
-        // Driving / Flying controls
-        if (trig(rightPad, 0) > 0.15 || ly < -0.35) nextKeys.add('KeyW'); // Gas
-        if (trig(leftPad, 0) > 0.15 || ly > 0.35) nextKeys.add('KeyS');   // Brake / Reverse
-        if (rGrip || btnA) nextKeys.add('Space'); // Handbrake
-        if (lGrip) nextKeys.add('KeyE');          // Horn
-        if (btnB) nextKeys.add('KeyV');           // Cycle Camera (First-Person VR view)
-        if (btnX) nextKeys.add('KeyQ');           // Radio Wheel
-        if (btnY) nextKeys.add('KeyF');           // Exit Vehicle
-        if (rStickClick) nextKeys.add('KeyC');    // Look Behind
-        if (lStickClick) nextKeys.add('KeyH');    // Headlights
+      if (vrMenuCursorMode) {
+        // Menu navigation with sticks & trigger click
+        if (ly < -0.35) nextKeys.add('ArrowUp');
+        if (ly > 0.35) nextKeys.add('ArrowDown');
+        if (lx < -0.35) nextKeys.add('ArrowLeft');
+        if (lx > 0.35) nextKeys.add('ArrowRight');
+        if (!hoveringUI && trig(rightPad, 0) > 0.35) nextMouse |= 1;
+        if (btnA) nextKeys.add('Enter');
+        if (btnB) nextKeys.add('Backspace');
+      } else if (drivingMode) {
+        if (trig(rightPad, 0) > 0.15 || ly < -0.3) nextKeys.add('KeyW');
+        if (trig(leftPad, 0) > 0.15 || ly > 0.3) nextKeys.add('KeyS');
+        if (rGrip || btnA) nextKeys.add('Space');
+        if (lGrip) nextKeys.add('KeyE');
+        if (btnB && !latchDriveCamClick) { schedulePulse('KeyV', 120, 0); latchDriveCamClick = true; }
+        else if (!btnB) latchDriveCamClick = false;
+        if (btnX) nextKeys.add('KeyQ');
+        if (btnY) nextKeys.add('KeyF');
+        if (rStickClick) nextKeys.add('KeyC');
+        if (lStickClick) nextKeys.add('KeyH');
       } else {
-        // On-Foot controls
         if (ly < -0.15) nextKeys.add('KeyW');
         if (ly > 0.15) nextKeys.add('KeyS');
-        if (trig(rightPad, 0) > 0.25) nextMouse |= 1; // Fire (Left Mouse)
-        if (rGrip) nextMouse |= 2;                    // Aim (Right Mouse)
-        if (trig(leftPad, 0) > 0.25) nextKeys.add('ControlLeft'); // Stealth / Crouch
-        if (lGrip) nextKeys.add('Tab');               // Weapon Wheel
-        if (btnA) nextKeys.add('Space');              // Jump / Climb
-        if (btnB) nextKeys.add('ShiftLeft');          // Sprint
-        if (btnX) nextKeys.add('KeyR');               // Reload
-        if (btnY) nextKeys.add('KeyF');               // Enter / Exit Vehicle
-        if (rStickClick) nextKeys.add('KeyC');        // Look Behind
-        if (lStickClick && !latchFpsView) { nextKeys.add('KeyV'); latchFpsView = true; }
-        else if (!lStickClick) latchFpsView = false;
+        if (!hoveringUI && trig(rightPad, 0) > 0.2) nextMouse |= 1; // Fire weapon
+        if (rGrip) nextMouse |= 2;                                   // Aim down sights
+        if (trig(leftPad, 0) > 0.25) nextKeys.add('ControlLeft');    // Stealth / Crouch
+        if (lGrip) nextKeys.add('Tab');                              // Weapon Wheel
+        if (btnA) nextKeys.add('Space');                             // Jump / Climb
+        if (btnB) nextKeys.add('ShiftLeft');                         // Sprint
+        if (btnX) nextKeys.add('KeyR');                              // Reload
+        if (btnY) nextKeys.add('KeyF');                              // Enter / Exit Vehicle
+        if (rStickClick) nextKeys.add('KeyC');                       // Look Behind
+        if (lStickClick && !latchFpsClick) { schedulePulse('KeyV', 120, 0); latchFpsClick = true; }
+        else if (!lStickClick) latchFpsClick = false;
       }
     }
 
-    // Camera Look: Right Thumbstick + Optional Quest 3 Head Orientation Deltas
-    remLookX += rx * LOOK_STICK_SPEED * dt;
-    remLookY += ry * LOOK_STICK_SPEED * dt;
+    // Camera Look: Right Thumbstick + Headset Orientation
+    let dx = 0, dy = 0;
+    if (!vrMenuCursorMode) {
+      remLookX += rx * LOOK_STICK_SPEED * dt;
+      remLookY += ry * LOOK_STICK_SPEED * dt;
 
-    if (headLookEnabled && pose && !vrMenuCursorMode && !loadEl) {
-      const { yaw, pitch } = quatToYawPitch(pose.transform.orientation);
-      if (prevHeadYaw !== null && prevHeadPitch !== null) {
-        const dYaw = wrapAngleDelta(yaw - prevHeadYaw);
-        const dPitch = wrapAngleDelta(pitch - prevHeadPitch);
-        // Negate dYaw because turning head right decreases yaw in WebXR right-handed coordinates
-        remLookX += (-dYaw) * HEAD_LOOK_YAW_SENS;
-        remLookY += (-dPitch) * HEAD_LOOK_PITCH_SENS;
+      if (headLookEnabled && pose && ready) {
+        const { yaw, pitch } = quatToYawPitch(pose.transform.orientation);
+        if (prevHeadYaw !== null && prevHeadPitch !== null) {
+          const dYaw = wrapAngleDelta(yaw - prevHeadYaw);
+          const dPitch = wrapAngleDelta(pitch - prevHeadPitch);
+          remLookX += (-dYaw) * HEAD_LOOK_YAW_SENS;
+          remLookY += (-dPitch) * HEAD_LOOK_PITCH_SENS;
+        }
+        prevHeadYaw = yaw;
+        prevHeadPitch = pitch;
+      } else {
+        prevHeadYaw = null;
+        prevHeadPitch = null;
       }
-      prevHeadYaw = yaw;
-      prevHeadPitch = pitch;
+
+      dx = Math.trunc(remLookX);
+      dy = Math.trunc(remLookY);
+      remLookX -= dx;
+      remLookY -= dy;
     } else {
       prevHeadYaw = null;
       prevHeadPitch = null;
     }
 
-    const dx = Math.trunc(remLookX);
-    const dy = Math.trunc(remLookY);
-    remLookX -= dx;
-    remLookY -= dy;
-
-    writeInputs(nextKeys, nextMouse, dx, dy, dz);
+    writeInputs(nextKeys, nextMouse, dx, dy, dz, screenCursorUV);
+    return raysToDraw;
   }
 
   // ---- WebXR Frame Loop ----
@@ -535,7 +857,7 @@
     prevTime = time;
 
     const pose = frame.getViewerPose(xrRefSpace);
-    processQuestInputs(xrSession, pose, dt);
+    const rays = processQuestInputs(xrSession, frame, pose, dt);
     if (!pose) return;
 
     const { yaw } = quatToYawPitch(pose.transform.orientation);
@@ -549,32 +871,33 @@
 
     const baseLayer = xrSession.renderState.baseLayer;
     gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
-    gl.clearColor(0.015, 0.02, 0.02, 1.0);
+    gl.clearColor(0.012, 0.018, 0.016, 1.0);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-    // Upload live GTA V WebGPU canvas OR loading screen mirror
-    const loadingEl = document.getElementById('loading');
-    const gameCanvas = document.getElementById('canvas');
-    if (loadingEl && !loadingEl.classList.contains('done')) {
+    // Upload texture: prefer direct worker ImageBitmap (works even when 2D browser window is hidden!), then gameCanvas, then loading mirror
+    const ready = isWorldReady();
+    if (!ready) {
       updateLoadingMirrorTexture();
-    } else if (gameCanvas && gameCanvas.width > 0 && gameCanvas.height > 0) {
+    } else if (hasNewBitmap && latestBitmap) {
       gl.bindTexture(gl.TEXTURE_2D, gameTex);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      try {
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gameCanvas);
-      } catch {
-        updateLoadingMirrorTexture();
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, latestBitmap);
+      hasNewBitmap = false;
+      if (vrPort) {
+        try { vrPort.postMessage({ ack: true }); } catch {}
+      }
+    } else if (!latestBitmap) {
+      const gameCanvas = document.getElementById('canvas');
+      if (gameCanvas && gameCanvas.width > 0 && gameCanvas.height > 0) {
+        gl.bindTexture(gl.TEXTURE_2D, gameTex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gameCanvas); } catch {}
       }
     }
 
     updateHudTexture();
 
     const modelMat = mat4FromTranslationYaw(anchorPos[0], anchorPos[1], anchorPos[2], anchorYaw);
-
-    gl.useProgram(glProgram);
-    gl.disable(gl.DEPTH_TEST);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
     for (const view of pose.views) {
       const vp = baseLayer.getViewport(view);
@@ -583,9 +906,13 @@
       const viewMat = view.transform.inverse.matrix;
       const vpMat = mat4Multiply(view.projectionMatrix, viewMat);
       const mvp = mat4Multiply(vpMat, modelMat);
+
+      gl.useProgram(glProgram);
+      gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       gl.uniformMatrix4fv(glProgram.uMvp, false, mvp);
 
-      // 1. Draw main GTA V curved screen
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, gameTex);
       gl.uniform1i(glProgram.uTex, 0);
@@ -593,11 +920,24 @@
       gl.bindVertexArray(screenMesh.vao);
       gl.drawElements(gl.TRIANGLES, screenMesh.count, gl.UNSIGNED_SHORT, 0);
 
-      // 2. Draw floating Quest 3 control status bar beneath screen
       gl.bindTexture(gl.TEXTURE_2D, hudTex);
       gl.uniform1f(glProgram.uAlpha, 0.96);
       gl.bindVertexArray(hudMesh.vao);
       gl.drawElements(gl.TRIANGLES, hudMesh.count, gl.UNSIGNED_SHORT, 0);
+
+      // Draw controller laser rays & endpoint dots
+      if (rays && rays.length) {
+        gl.useProgram(rayProgram);
+        gl.uniformMatrix4fv(rayProgram.uVp, false, vpMat);
+        gl.bindVertexArray(rayVao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, rayVbo);
+        for (const r of rays) {
+          gl.uniform4fv(rayProgram.uColor, r.color);
+          gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array([r.x0, r.y0, r.z0, r.x1, r.y1, r.z1]));
+          gl.drawArrays(gl.LINES, 0, 2);
+          gl.drawArrays(gl.POINTS, 1, 1);
+        }
+      }
     }
 
     gl.bindVertexArray(null);
@@ -645,16 +985,23 @@
       });
 
       window.__GTA5_VR_ACTIVE = true;
+      if (vrPort) vrPort.postMessage({ vrActive: true, ack: true });
       if (vrBtn) vrBtn.textContent = 'Exit VR';
       needsRecenter = true;
       prevHeadYaw = null;
       prevHeadPitch = null;
       prevTime = 0;
 
+      if (isWorldReady() && !autoFirstPersonDone) {
+        autoFirstPersonDone = true;
+        setTimeout(() => { if (xrSession) scheduleFirstPersonTriple(); }, 350);
+      }
+
       xrSession.addEventListener('end', () => {
         xrSession = null;
         xrRefSpace = null;
         window.__GTA5_VR_ACTIVE = false;
+        if (vrPort) vrPort.postMessage({ vrActive: false, ack: true });
         releaseAllVRInputs();
         if (vrBtn) vrBtn.textContent = 'VR Mode (Quest 3)';
       });
@@ -673,6 +1020,7 @@
     } catch (err) {
       xrSession = null;
       window.__GTA5_VR_ACTIVE = false;
+      if (vrPort) vrPort.postMessage({ vrActive: false, ack: true });
       releaseAllVRInputs();
       if (vrBtn) vrBtn.textContent = 'VR Mode (Quest 3)';
       showToast('Failed to start WebXR session: ' + (err && err.message ? err.message : err));
