@@ -1,0 +1,6 @@
+{
+  "name": "GTA V WebGPU + Quest 3 WebXR",
+  "description": "Browser WebGPU/WebAssembly port of Grand Theft Auto V with Meta Quest 3 WebXR VR mode and Touch Plus controller mapping.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

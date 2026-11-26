@@ -1,0 +1,160 @@
+<!doctype html><html lang="en"><head>
+<script src="/chunk-index.js"></script>
+<script src="/chunk-fetch.js"></script>
+<script src="/__support/controller.js"></script>
+<script defer src="/__support/touch.js"></script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta charset="utf-8">
+<title>GTA V WebGPU + Quest 3 WebXR</title>
+<meta name="description" content="Browser WebGPU/WebAssembly port of Grand Theft Auto V with Meta Quest 3 WebXR VR mode and Touch Plus controller mapping.">
+<meta property="og:title" content="GTA V WebGPU + Quest 3 WebXR">
+<meta property="og:description" content="Browser WebGPU/WebAssembly port of Grand Theft Auto V with Meta Quest 3 WebXR VR mode and Touch Plus controller mapping.">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+	html, body { margin: 0; height: 100%; background: #000; color: #ccc; font: 12px monospace; overflow: hidden; }
+	#canvas { display: block; position: absolute; left: 0; top: 0; width: 100vw; height: 100vh; background: #000; }
+	/* title screen: the game's loading screen (LOADINGSCREEN_STARTUP) on its 1280x720 stage, scaled to the window; see the script below */
+	@font-face { font-family: 'Chalet'; src: url('/b/8b0b5899ed/title/chalet.woff') format('woff'); }
+	#loading { position: fixed; inset: 0; background: #000; overflow: hidden; transition: opacity .8s; z-index: 5; }
+	#loading.done { opacity: 0; pointer-events: none; }
+	#ls-stage { position: absolute; left: 0; top: 0; width: 1280px; height: 720px; transform-origin: 0 0; overflow: hidden; font: 12px Chalet, sans-serif; color: #fff; }
+	#ls-screens { position: absolute; inset: 0; }
+	.ls-screen { position: absolute; inset: 0; }
+	/* one camera per layer, so layers composite in display-list order like Scaleform (no depth test): 640 / tan(55 deg / 2) = 1229, Scaleform's default 3D camera
+	   at the stage centre (moved against the screen's slide, see the script) */
+	.ls-cam { position: absolute; inset: 0; perspective: 1229px; perspective-origin: 640px 360px; }
+	.ls-layer { position: absolute; left: 0; top: 0; transform-origin: 0 0; background-size: 100% 100%; }
+	#ls-logo { position: absolute; left: 95px; top: 492.5px; width: 186px; height: 186px; }
+	#ls-bars { position: absolute; right: 96px; top: 642px; display: flex; gap: 3px; }
+	.ls-bar { height: 24px; padding: 0 6px; display: flex; align-items: center; background: rgba(0, 0, 0, .706); border-radius: 2.4px; white-space: nowrap; }
+	#modes { gap: 8px; }
+	#modes button { display: flex; align-items: center; height: 24px; padding: 0; border: 0; background: none; color: #fff; font: 12px Chalet, sans-serif; cursor: pointer; }
+	#modes button:disabled { cursor: default; }
+	#modes button[hidden] { display: none; }
+	#modes.ask button:not(:disabled) .ls-key { animation: ls-ask 1.2s ease-in-out infinite; }
+	@keyframes ls-ask { 50% { opacity: .35; } }
+	.ls-key { margin-left: 4px; min-width: 12px; height: 15px; padding: 0 4px; line-height: 16px; border-radius: 2px; background: #fff; color: #000; font-size: 10px; text-transform: uppercase; }
+	.ls-spin { flex: none; width: 22px; height: 22px; margin-left: 2px; background: url('/b/8b0b5899ed/title/spinner.png') center / 24px 24px no-repeat; animation: ls-spin 2s steps(60) infinite; }
+	@keyframes ls-spin { from { transform: rotate(0deg) scaleX(-1); } to { transform: rotate(-360deg) scaleX(-1); } }
+	#label { text-shadow: .85px .85px 1px rgba(0, 0, 0, .45); }
+	#pct { margin-left: 15px; font-variant-numeric: tabular-nums; }
+	/* kept for now: the port's progress bar along the bottom edge, the newest log line centred above it and the data downloaded above that */
+	#ls-log { position: absolute; left: 8px; right: 8px; bottom: 6px; display: flex; flex-direction: column; align-items: center; font: 10px/1.35 Consolas, monospace; color: rgba(190, 190, 190, .75); text-shadow: 0 0 2px #000, 1px 1px 1px #000; white-space: pre; pointer-events: none; }
+	#console { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+	#data { color: #6a9; }
+	#bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255, 255, 255, .08); }
+	#fill { height: 100%; width: 0; background: #7cc576; }
+	#hud { position: fixed; left: 8px; bottom: 8px; max-width: 60vw; white-space: pre-wrap; opacity: .8; pointer-events: none; }
+	#fps { position: fixed; left: 8px; top: 6px; display: none; color: #0f0; font: bold 18px/1.2 Consolas, monospace; font-variant-numeric: tabular-nums; text-shadow: 1px 1px 2px #000, 0 0 3px #000; pointer-events: none; z-index: 10; }
+</style>
+</head><body>
+<style>
+@media(pointer:coarse){#canvas{height:100dvh!important;touch-action:none}#modes{position:fixed!important;bottom:70px!important;left:0!important;right:0!important;height:auto!important;display:flex!important;flex-wrap:wrap;justify-content:center;gap:8px;padding:12px;background:#102b27}#modes button{min-height:48px!important;padding:8px 16px!important;font:16px system-ui!important}#ls-stage{transform:none!important;width:100%!important;height:100%!important}#ls-bars{top:auto!important;bottom:170px!important;left:12px!important;right:12px!important;max-width:100%!important}#ls-logo{top:24px!important;left:24px!important;width:100px!important;height:100px!important}#game-tools{bottom:max(8px,env(safe-area-inset-bottom))!important}}
+#game-tools{position:fixed;left:12px;bottom:12px;z-index:10005;display:flex;flex-wrap:wrap;gap:6px;font:14px system-ui}
+#game-tools a,#game-tools button{box-sizing:border-box;background:#182621e8;color:#fff;padding:10px 14px;border:1px solid #789184;border-radius:24px;min-height:44px;font:inherit;text-decoration:none;cursor:pointer}
+#vr-mode-btn{background:#1b4d37f0!important;border-color:#7cc576!important;font-weight:600!important}
+html.game-tools-hidden [data-game-overlay],html.game-tools-hidden #game-help,html.game-tools-hidden #vr-controls-btn{display:none!important}
+html.game-tools-hidden #game-tools button{opacity:.5}
+#vr-toast{position:fixed;left:12px;bottom:68px;z-index:10006;max-width:440px;background:#111d18f5;color:#e6f4ec;border:1px solid #7cc576;border-radius:14px;padding:12px 16px;font:13px/1.45 system-ui;box-shadow:0 12px 32px rgba(0,0,0,.6)}
+#vr-controls-modal{position:fixed;inset:0;z-index:10010;background:rgba(0,0,0,.78);display:grid;place-items:center;padding:16px;font:14px/1.5 system-ui;color:#eef5f1}
+#vr-controls-modal[hidden]{display:none}
+#vr-controls-card{max-width:760px;width:100%;max-height:88dvh;overflow:auto;background:#121e19;border:1px solid #789184;border-radius:20px;padding:22px 24px;box-shadow:0 24px 64px rgba(0,0,0,.75)}
+#vr-controls-card h2{margin:0 0 8px;font-size:20px;color:#7cc576}
+#vr-controls-card h3{margin:16px 0 6px;font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:#a5cbb8}
+#vr-controls-card table{width:100%;border-collapse:collapse;font-size:13px}
+#vr-controls-card td,#vr-controls-card th{padding:6px 8px;border-bottom:1px solid #263930;text-align:left}
+#vr-controls-card th{color:#94b8a6;font-weight:600}
+#vr-controls-close{margin-top:16px;background:#7cc576;color:#0a1510;border:0;border-radius:999px;padding:10px 20px;font:600 14px system-ui;cursor:pointer}
+</style>
+<div id="game-tools">
+  <a id="game-help" href="/__support/" target="_blank" rel="noopener">Help / browser checks</a>
+  <button id="vr-mode-btn" type="button" data-game-overlay="">VR Mode (Quest 3)</button>
+  <button id="vr-controls-btn" type="button" data-game-overlay="">VR Controls</button>
+  <button id="game-tools-toggle" type="button" aria-label="Hide extra controls (F8)" aria-pressed="false">Hide · F8</button>
+</div>
+<div id="vr-toast" hidden></div>
+<div id="vr-controls-modal" hidden>
+  <div id="vr-controls-card">
+    <h2>Meta Quest 3 WebXR Controls (Touch Plus)</h2>
+    <p style="margin:0 0 10px;color:#b8ccc2">Works natively in Meta Quest 3 WebXR (Quest Browser or PC Chrome/Edge over Quest Link / Air Link / Virtual Desktop).</p>
+    <h3>On-Foot</h3>
+    <table>
+      <tr><th>Input</th><th>Action</th></tr>
+      <tr><td>Left Thumbstick</td><td>Move (WASD)</td></tr>
+      <tr><td>Right Thumbstick / Head Movement</td><td>Look &amp; Aim</td></tr>
+      <tr><td>Right Trigger</td><td>Fire Weapon</td></tr>
+      <tr><td>Right Grip</td><td>Aim Down Sights</td></tr>
+      <tr><td>Left Trigger</td><td>Stealth / Crouch</td></tr>
+      <tr><td>Left Grip</td><td>Weapon Wheel (Tab)</td></tr>
+      <tr><td>A / B</td><td>Jump (Space) / Sprint (Shift)</td></tr>
+      <tr><td>X / Y</td><td>Reload (R) / Enter Vehicle (F)</td></tr>
+      <tr><td>Left Stick Click / Right Stick Click</td><td>First-Person Camera (V) / Look Behind (C)</td></tr>
+    </table>
+    <h3>Driving / Flying</h3>
+    <table>
+      <tr><th>Input</th><th>Action</th></tr>
+      <tr><td>Left Thumbstick</td><td>Steer Left / Right</td></tr>
+      <tr><td>Right Trigger / Left Trigger</td><td>Accelerate (Gas) / Brake &amp; Reverse</td></tr>
+      <tr><td>Right Grip / A</td><td>Handbrake (Space)</td></tr>
+      <tr><td>Left Grip</td><td>Car Horn (E)</td></tr>
+      <tr><td>B / X / Y</td><td>Cycle Camera (V) / Radio (Q) / Exit Vehicle (F)</td></tr>
+      <tr><td>Left Stick Click / Right Stick Click</td><td>Headlights (H) / Look Behind (C)</td></tr>
+    </table>
+    <h3>VR &amp; System Shortcuts</h3>
+    <table>
+      <tr><th>Combo</th><th>Action</th></tr>
+      <tr><td>Left Grip + Right Grip</td><td>Switch On-Foot &harr; Driving Controls</td></tr>
+      <tr><td>Left Stick Click + Right Stick Click</td><td>Pause Menu (Esc)</td></tr>
+      <tr><td>X + Y</td><td>Recenter VR Screen</td></tr>
+      <tr><td>Left Grip + X</td><td>Toggle Headset Head-Look ON/OFF</td></tr>
+      <tr><td>Left Grip + Y</td><td>Toggle Theater (Fixed) vs Follow Screen</td></tr>
+      <tr><td>Left Grip + B</td><td>Toggle Menu Cursor Mode</td></tr>
+      <tr><td>Loading Screen: A / X / Y</td><td>Story Mode / Sandbox GTA V / Sandbox GTA VI</td></tr>
+    </table>
+    <button id="vr-controls-close" type="button">Close</button>
+  </div>
+</div>
+<script>(() => {
+  const button = document.getElementById('game-tools-toggle');
+  function setHidden(hidden) {
+    document.documentElement.classList.toggle('game-tools-hidden', hidden);
+    button.textContent = hidden ? 'Tools · F8' : 'Hide · F8';
+    button.setAttribute('aria-pressed', String(hidden));
+    button.setAttribute('aria-label', (hidden ? 'Show' : 'Hide') + ' extra controls (F8)');
+    dispatchEvent(new CustomEvent('game-tools-visibility', {detail:{hidden}}));
+    try { sessionStorage.setItem('playgta5.toolsHidden', String(hidden)); } catch {}
+  }
+  const toggle = () => setHidden(!document.documentElement.classList.contains('game-tools-hidden'));
+  button.onclick = toggle;
+  for (const type of ['keydown', 'keyup']) addEventListener(type, e => {
+    if (e.code !== 'F8') return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (type === 'keydown' && !e.repeat) toggle();
+  }, true);
+  try { setHidden(sessionStorage.getItem('playgta5.toolsHidden') === 'true'); } catch {}
+})();</script>
+<canvas id="canvas" width="800" height="600" tabindex="-1"></canvas>
+<div id="hud"></div>
+<div id="loading">
+  <div id="ls-stage">
+    <div id="ls-screens"></div>
+    <img id="ls-logo" src="/b/8b0b5899ed/title/logo.png" alt="">
+    <div id="ls-bars">
+      <div id="modes" class="ls-bar">
+        <button data-act="back"></button>
+        <button data-act="map5"></button>
+        <button data-act="map6"></button>
+        <button data-act="sandbox"></button>
+        <button data-act="story"></button>
+      </div>
+      <div class="ls-bar"><span id="label">Starting...</span><span id="pct">0%</span><i class="ls-spin"></i></div>
+    </div>
+  </div>
+  <div id="ls-log"><div id="data"></div><div id="console"></div></div>
+  <div id="bar"><div id="fill"></div></div>
+</div>
+<div id="fps"></div>
+<script defer src="/vr-webxr.js"></script>
+<script type="module" src="/game-boot.js"></script>
+</body></html>
