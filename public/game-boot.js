@@ -513,6 +513,18 @@ function installInput(memory, block) {
 		VK,
 		canvas,
 		getSize: () => [W, H],
+		pushChar: (charCode) => {
+			if (_vrBuf !== memory.buffer) {
+				_vrBuf = memory.buffer;
+				_vrW = new Int32Array(_vrBuf, block + 256, 10);
+			}
+			const ring = new Uint16Array(memory.buffer, block + 256 + 40, 64);
+			const head = Atomics.load(_vrW, 8);
+			if (((head - Atomics.load(_vrW, 9)) >>> 0) < 64) {
+				ring[head & 63] = charCode;
+				Atomics.store(_vrW, 8, (head + 1) | 0);
+			}
+		},
 		getViews: () => {
 			if (_vrBuf !== memory.buffer) {
 				_vrBuf = memory.buffer;
@@ -521,7 +533,7 @@ function installInput(memory, block) {
 				window.__GTA5_INPUT__.keys = _vrKeys;
 				window.__GTA5_INPUT__.w = _vrW;
 			}
-			return { keys: _vrKeys, w: _vrW };
+			return { keys: _vrKeys, w: _vrW, U16: new Uint16Array(memory.buffer, block + 256 + 40, 64) };
 		}
 	};
 	window.dispatchEvent(new CustomEvent('gta5-input-ready', { detail: window.__GTA5_INPUT__ }));

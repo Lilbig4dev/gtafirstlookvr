@@ -2662,17 +2662,19 @@ async function present(id) {
 		if (!blit) makeBlit();
 		if (!t.blitBG) t.blitBG = device.createBindGroup({ layout: blit.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.tex.createView({ dimension: '2d', baseMipLevel: 0, mipLevelCount: 1 }) }] });
 		if (canvasCtx) {
-			// configure() reallocates the canvas's swap-chain textures: only on the first present and when the back buffer size changes (it ran every frame)
-			if (!canvasConfigured || canvas.width !== tw || canvas.height !== th) {
-				canvas.width = tw; canvas.height = th;
-				canvasCtx.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
-				canvasConfigured = true;
-			}
-			const pass2 = getEncoder().beginRenderPass({ colorAttachments: [{ view: canvasCtx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
-			pass2.setPipeline(blit);
-			pass2.setBindGroup(0, t.blitBG);
-			pass2.draw(3);
-			pass2.end();
+			try {
+				// configure() reallocates the canvas's swap-chain textures: only on the first present and when the back buffer size changes (it ran every frame)
+				if (!canvasConfigured || canvas.width !== tw || canvas.height !== th) {
+					canvas.width = tw; canvas.height = th;
+					canvasCtx.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+					canvasConfigured = true;
+				}
+				const pass2 = getEncoder().beginRenderPass({ colorAttachments: [{ view: canvasCtx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
+				pass2.setPipeline(blit);
+				pass2.setBindGroup(0, t.blitBG);
+				pass2.draw(3);
+				pass2.end();
+			} catch {}
 		}
 		if (vrStreamActive && vrPort && typeof OffscreenCanvas !== 'undefined') {
 			if (!vrCanvas) {
