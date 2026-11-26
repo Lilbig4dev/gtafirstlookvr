@@ -1,5 +1,21 @@
 
 
+// Self-heal crossOriginIsolated via /coi-sw.js only if the host omitted COOP/COEP headers.
+if (isSecureContext && !crossOriginIsolated && 'serviceWorker' in navigator && !sessionStorage.getItem('playgta5.coiTried')) {
+  sessionStorage.setItem('playgta5.coiTried', '1');
+  try {
+    const reg = await navigator.serviceWorker.register('/coi-sw.js');
+    if (reg.installing || reg.waiting) {
+      await new Promise((resolve) => {
+        const sw = reg.installing || reg.waiting;
+        sw.addEventListener('statechange', () => { if (sw.state === 'activated') resolve(); });
+        setTimeout(resolve, 2500);
+      });
+    }
+    location.reload();
+    await new Promise(() => {});
+  } catch {}
+}
 // Explain unavailable browser capabilities before downloading/starting the engine.
 let startupAdapter = null;
 let startupFailure = !isSecureContext ? 'secure-context'
@@ -329,7 +345,7 @@ addEventListener('pagehide', () => { try { new BroadcastChannel('game-io').postM
 // Earlier versions cached the game data with a service worker (sw.js) and the Cache API: remove both, the io worker keeps its own store (io_worker.js).
 async function dropOldCache() {
 	try {
-		if ('serviceWorker' in navigator) for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+		if ('serviceWorker' in navigator) for (const r of await navigator.serviceWorker.getRegistrations()) if (!(r.active && r.active.scriptURL.endsWith('/coi-sw.js'))) await r.unregister();
 		if (window.caches) for (const k of await caches.keys()) if (k.startsWith('gamedata')) await caches.delete(k);
 	} catch (e) { console.warn('could not remove the old cache: ' + e); }
 }
